@@ -1,0 +1,27 @@
+# Leyline: our own code and docs only. Never game data, secrets or machine-local files.
+**/state/
+**/cache/
+**/realm-files/
+**/logs/
+.env
+*.env
+!*.env.example
+!hosting/kit/tools/wunet/leyline.env
+*.pem
+*.key
+*.log
+__pycache__/
+*.pyc
+*.mpq
+*.MPQ
+*.m2
+*.wmo
+*.adt
+*.blp
+*.dbc
+*.skin
+*.anim
+*.tgz
+*.part*
+.DS_Store
+Thumbs.db
