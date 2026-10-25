@@ -8,6 +8,7 @@ Leyline is an open, peer-to-peer network for playing, hosting and modding commun
 - **Stay private**: your realm talks out to the Leyline relay, players connect to the relay, and nobody
   sees your home address. No port forwarding.
 - **Share** invite links, list your realm on the Leyline realm list (Beacons), and share mods.
+- **Launch** your own installed client (3.3.5a or 1.12.1) from the Leyline desktop app (`launcher/`).
 - **Open source**, MIT licensed. No game data is in this repo: hosts extract it from their own install,
   on their own PC.
 
@@ -49,6 +50,8 @@ panel); run those there.
 | `stream/links.py` | short share links for realms, hangouts, queues, mods and players |
 | `stream/www-files/art/` | the Leyline art and display font (SIL OFL 1.1) |
 | `mods/SPEC.md` | the mod package format |
+| `docs/leyline/` | the Leyline docs: play, mods, publishing, hosting, launcher, Hero Key, other servers, commands |
+| `launcher/` | the Leyline desktop app (Windows, macOS, Linux): pick a client, point it at a realm, play. Build steps in `launcher/README.md` |
 
 The Mods & Workshop panel (`ModsPanel.lua`) uses the rest of the WrathUnleashed UI addon, so it stays in
 WrathUnleashed; the in-game window here opens from it.

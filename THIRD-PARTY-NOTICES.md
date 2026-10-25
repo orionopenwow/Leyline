@@ -9,5 +9,7 @@ Leyline's own code is MIT licensed (`LICENSE`). These parts come from elsewhere 
 - **SRP6 test vectors** (`hosting/tests/test_crypto.py`): from a public MIT-licensed SRP test corpus.
 - **AzerothCore** (AGPL-3.0): the realm images the host kit runs are built from AzerothCore and its modules.
   No AzerothCore source is in this repo; its sources are at https://github.com/azerothcore.
+- **Tauri** (MIT or Apache-2.0) and the Rust crates in `launcher/src-tauri/Cargo.lock`, each under its own
+  license (mostly MIT or Apache-2.0): the launcher is built with them; none of their source is in this repo.
 - **Game data**: none here. Hosts extract dbc and map files from their own 3.3.5a install, on their own PC,
   and they never leave it.

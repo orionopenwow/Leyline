@@ -12,6 +12,9 @@
 *.log
 __pycache__/
 *.pyc
+node_modules/
+launcher/src-tauri/target/
+launcher/src-tauri/gen/
 *.mpq
 *.MPQ
 *.m2
