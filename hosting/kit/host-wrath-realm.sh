@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host a WrathUnleashed (3.3.5a) realm from this Mac or Linux PC. Needs Docker, nothing else.
+# Host a Leyline (3.3.5a) realm from this Mac or Linux PC. Needs Docker, nothing else.
 # No port forwarding: the realm talks out to the relay, players connect to the relay, nobody sees
 # your home IP address.
 #
@@ -16,7 +16,7 @@
 #   bash host-wrath-realm.sh logs [service]
 #
 # Answers can come from the environment (no questions): WU_NAME, WU_PROFILE (main|brawl|progression|dalaran, or a
-# profile for another client: profiles/<id>/, e.g. cmangos-1.12.1, cmangos-2.4.3, tcpp-4.3.4), WU_VISIBILITY
+# profile for another client: profiles/<id>/, e.g. cmangos-1.12.1, cmangos-2.4.3), WU_VISIBILITY
 # (private|public), WU_WOW_DIR (your 3.3.5a folder), WU_CLIENT_DIR (your game folder for another client's profile). Images: WU_IMAGE / WU_TAG
 # (prebuilt, default below), falling back to the locally built ov/ac-wotlk-*:custom. Not published yet and
 # not built here: it asks "build or stock" (WU_BUILD=1 builds, WU_BUILD=0 takes AzerothCore's stock images).
@@ -125,7 +125,7 @@ pick_images() {
   step "Realm images"
   local err=""
   if err=$(pull_prebuilt 2>&1); then
-    IMG="$WU_IMAGE"; TAG="$WU_TAG"; say "  Using the prebuilt WrathUnleashed images ($IMG-*:$TAG)."
+    IMG="$WU_IMAGE"; TAG="$WU_TAG"; say "  Using the prebuilt Leyline images ($IMG-*:$TAG)."
   elif docker image inspect "$WU_LOCAL_IMAGE-worldserver:$WU_LOCAL_TAG" >/dev/null 2>&1; then
     IMG="$WU_LOCAL_IMAGE"; TAG="$WU_LOCAL_TAG"; say "  Using the images built on this PC ($IMG-*:$TAG)."
   else
@@ -146,7 +146,7 @@ pick_images() {
       IMG="$WU_LOCAL_IMAGE"; TAG="$WU_LOCAL_TAG"
     else
       IMG="acore/ac-wotlk"; TAG="master"
-      say "  Using AzerothCore's stock images: the realm runs without WrathUnleashed's modules."
+      say "  Using AzerothCore's stock images: the realm runs without Leyline's modules."
     fi
   fi
   ensure_tools
