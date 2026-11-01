@@ -271,6 +271,11 @@ pub fn parse_catalog(src: &str) -> Catalog {
 
 /// The kit's catalog (its realm scripts, as the realm runs them).
 pub fn catalog(kit: &Path) -> Result<Catalog, String> {
+    if is_lite(kit) && !scripts_dir(kit).join("ov_build.lua").is_file() {
+        return Err("The player's Den is Den Lite now, which builds by hand only (.den place, .den stamp in game): the catalog, \
+            recipes and den_place_layout need the full Den (Leyline › Host › Your Den with Docker). den_status, den_messages and \
+            den_say work here.".into());
+    }
     let src = fs::read_to_string(scripts_dir(kit).join("ov_build.lua"))
         .map_err(|_| "The player's realm files have no Builder (realm-files/lua_scripts/ov_build.lua): update the Host pack.".to_string())?;
     let c = parse_catalog(&src);
@@ -1191,9 +1196,24 @@ fn say_text(args: &Value) -> Result<String, String> {
 
 // ------------------------------------------------------------------------------------------------ the tools
 
-/// The kit, for the Den tools.
+/// Den Lite's folder (labs/den-lite, `<app dir>/den-lite`, laid out like a Host pack: host/lite.rs): its companion
+/// heartbeat says `"server": "den-lite"`.
+fn is_lite(kit: &Path) -> bool {
+    companion_in(kit).is_some_and(|v| v.get("server").and_then(Value::as_str) == Some("den-lite"))
+}
+
+/// The Den the tools work on: Den Lite's while it runs (its heartbeat is fresh), else the Host pack's; with no Host
+/// pack, Den Lite's once it has run. Den Lite writes and reads the same companion files (its src/companion.rs).
 fn den_kit(app_dir: &Path) -> Result<PathBuf, String> {
-    super::need_kit(app_dir).map_err(|_| "The player has no Den on this PC yet: Leyline › Host › Your Den sets one up.".to_string())
+    let lite = crate::host::lite::root(app_dir);
+    if is_lite(&lite) && companion_in(&lite).as_ref().is_some_and(is_fresh) {
+        return Ok(lite);
+    }
+    match super::need_kit(app_dir) {
+        Ok(k) => Ok(k),
+        Err(_) if is_lite(&lite) => Ok(lite),
+        Err(_) => Err("The player has no Den on this PC yet: Leyline › Host › Your Den sets one up.".to_string()),
+    }
 }
 
 fn used_now(kit: &Path) -> Option<(u32, u32)> {
@@ -1412,7 +1432,16 @@ doorway is in the middle of the wall at y = -half), z is height above the floor.
 against the room's points, outside (the yard, up to r yards from the middle) against the yard's.";
 
 fn status(kit: &Path) -> Value {
-    let lim = limits(kit);
+    let mut lim = limits(kit);
+    let lite = is_lite(kit);
+    if lite {
+        // Den Lite's room grows (.den grow): its heartbeat says how big it is now
+        let room = companion_in(kit).and_then(|v| v.get("room").cloned()).unwrap_or(Value::Null);
+        if let (Some(h), Some(r)) = (room.get("half").and_then(Value::as_f64), room.get("r").and_then(Value::as_f64)) {
+            lim.half = h;
+            lim.r = r;
+        }
+    }
     let set_up = kit.join("state").join("host.json").is_file();
     let (den_realm, running) = if set_up {
         let c = crate::host::console::console(kit);
@@ -1427,7 +1456,7 @@ fn status(kit: &Path) -> Value {
     let unread = asks(kit).iter().filter(|a| a["n"].as_u64().unwrap_or(0) > seen).count();
     let files: Vec<Value> = dens::list(kit).into_iter().take(50).map(|f| json!({"name": f.name, "props": f.props, "saved": f.saved})).collect();
     json!({
-        "den_set_up": set_up, "den_realm": den_realm, "realm_running": running,
+        "den_set_up": set_up || lite, "den_lite": lite, "den_realm": den_realm || lite, "realm_running": if lite { Some(fresh) } else { running },
         "companion": {"script_on": cin.is_some(), "realm_heard_from": fresh, "out": fresh && pick("companion") == json!(true),
             "unread_messages": unread, "said_up_to": pick("said")},
         "owner": if fresh { pick("owner") } else { Value::Null },
@@ -1502,6 +1531,15 @@ mod tests {
     use super::*;
 
     // Read at test time, not include_str!: the public Leyline export leaves realm/ out.
+    /// The public Leyline repo has no realm/ folder (tools/leyline-repo/export.py): the tests that need its realm
+    /// scripts skip there with a note instead of failing its build.
+    fn have_realm() -> bool {
+        let ok = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../realm/custom/lua_scripts/ov_build.lua").is_file();
+        if !ok {
+            eprintln!("skipped: this copy has no realm/ folder (the public Leyline repo)");
+        }
+        ok
+    }
     fn repo_file(rel: &str) -> &'static str {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel);
         Box::leak(fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).into_boxed_str())
@@ -1527,6 +1565,9 @@ mod tests {
 
     #[test]
     fn the_catalog_from_the_realm_script() {
+        if !have_realm() {
+            return;
+        }
         let c = parse_catalog(OV_BUILD());
         assert!(c.entries.len() > 350, "{}", c.entries.len());
         let lantern = c.key("lantern").unwrap();
@@ -1549,6 +1590,9 @@ mod tests {
 
     #[test]
     fn limits_from_the_den_profile() {
+        if !have_realm() {
+            return;
+        }
         let d = tempfile::tempdir().unwrap();
         kit_at(d.path());
         let l = limits(d.path());
@@ -1560,6 +1604,9 @@ mod tests {
 
     #[test]
     fn expressions() {
+        if !have_realm() {
+            return;
+        }
         let mut env = HashMap::new();
         env.insert("n".to_string(), 4.0);
         let ev = |s: &str| eval(s, &env, 1.0);
@@ -1582,6 +1629,9 @@ mod tests {
 
     #[test]
     fn checking_a_layout() {
+        if !have_realm() {
+            return;
+        }
         let d = tempfile::tempdir().unwrap();
         kit_at(d.path());
         let (cat, lim) = (catalog(d.path()).unwrap(), limits(d.path()));
@@ -1615,6 +1665,9 @@ mod tests {
 
     #[test]
     fn the_starter_recipes_fit_a_den() {
+        if !have_realm() {
+            return;
+        }
         let d = tempfile::tempdir().unwrap();
         kit_at(d.path());
         let (cat, lim) = (catalog(d.path()).unwrap(), limits(d.path()));
@@ -1663,6 +1716,9 @@ mod tests {
     #[cfg(not(feature = "lua-recipes"))]
     #[test]
     fn without_lua_a_script_is_listed_but_refused() {
+        if !have_realm() {
+            return;
+        }
         let t = setup();
         fs::create_dir_all(recipes_dir(t.kit.path())).unwrap();
         fs::write(recipes_dir(t.kit.path()).join("garden-script.recipe.lua"), include_str!("../../den-recipes/examples/garden-scatter-script.recipe.lua")).unwrap();
@@ -1683,6 +1739,9 @@ mod tests {
     #[cfg(feature = "lua-recipes")]
     #[test]
     fn the_example_script_runs() {
+        if !have_realm() {
+            return;
+        }
         let src = include_str!("../../den-recipes/examples/garden-scatter-script.recipe.lua");
         let r = parse_recipe("garden-script.recipe.lua", src, true, "yours").unwrap();
         let d = tempfile::tempdir().unwrap();
@@ -1696,6 +1755,9 @@ mod tests {
     #[cfg(feature = "lua-recipes")]
     #[test]
     fn the_sandbox_holds() {
+        if !have_realm() {
+            return;
+        }
         let meta = "recipe = { name = 'x', params = {} }\n";
         for (body, why) in [
             ("function build() return io.open('/etc/passwd') end", "io"),
@@ -1724,6 +1786,9 @@ mod tests {
 
     #[test]
     fn brand_words_and_clean_lines() {
+        if !have_realm() {
+            return;
+        }
         assert_eq!(clean_line("|cffff0000red|r\nnext\tline  "), "cffff0000red r next line");
         assert_eq!(brand_word("Wow, what a tavern"), Some("wow"));
         assert_eq!(brand_word("like in World of  Warcraft"), Some("world of warcraft"));
@@ -1796,6 +1861,9 @@ mod tests {
 
     #[test]
     fn reading_the_den() {
+        if !have_realm() {
+            return;
+        }
         let t = setup();
         let mut s = server(t.app.path());
         let (ok, text) = call(&mut s, "den_status", json!({}));
@@ -1825,7 +1893,45 @@ mod tests {
     }
 
     #[test]
+    fn den_lite_takes_the_companion_files_while_it_runs() {
+        if !have_realm() {
+            return;
+        }
+        let t = setup();
+        let mut s = server(t.app.path());
+        let lite = crate::host::lite::root(t.app.path());
+        fs::create_dir_all(dens::dir(&lite)).unwrap();
+        // Den Lite ran once (an old heartbeat): the Host pack's Den
+        heartbeat(&lite, json!({"server": "den-lite", "at": 5}));
+        assert_eq!(den_kit(t.app.path()).unwrap(), t.kit.path());
+        // running now, as labs/den-lite src/companion.rs writes it
+        heartbeat(&lite, json!({"server": "den-lite", "room": {"props": 0, "half": 16.0, "r": 30.0, "size": 2, "sizes": 4, "look": "white"},
+            "asks": [{"n": 1, "at": 5, "text": "a well by the door", "where": {"x": 0.0, "y": 2.5, "z": 1.0, "yaw": 90.0}}]}));
+        assert_eq!(den_kit(t.app.path()).unwrap(), lite);
+        let v: Value = serde_json::from_str(&call(&mut s, "den_status", json!({})).1).unwrap();
+        assert_eq!((v["den_lite"].clone(), v["limits"]["half"].clone(), v["companion"]["unread_messages"].clone()), (json!(true), json!(16.0), json!(1)));
+        let v: Value = serde_json::from_str(&call(&mut s, "den_messages", json!({})).1).unwrap();
+        assert_eq!(v["messages"][0]["text"], "a well by the door");
+        let h = launcher(t.app.path().to_path_buf(), true);
+        let (ok, text) = call(&mut s, "den_say", json!({"text": "A well, here?"}));
+        h.join().unwrap();
+        assert!(ok, "{text}");
+        let out: Value = serde_json::from_str(&fs::read_to_string(dens::dir(&lite).join(OUT_FILE)).unwrap()).unwrap();
+        assert_eq!((out["lines"][0]["n"].clone(), out["lines"][0]["text"].clone(), out["seen"].clone()), (json!(1), json!("A well, here?"), json!(1)));
+        assert!(!dens::dir(t.kit.path()).join(OUT_FILE).exists(), "nothing in the Host pack's Den");
+        let (ok, text) = call(&mut s, "den_catalog", json!({}));
+        assert!(!ok && text.contains("Den Lite"), "{text}");
+        // no Host pack: Den Lite's, once it has run
+        crate::settings::save(t.app.path(), &crate::settings::Settings::default()).unwrap();
+        heartbeat(&lite, json!({"server": "den-lite", "at": 5}));
+        assert_eq!(den_kit(t.app.path()).unwrap(), lite);
+    }
+
+    #[test]
     fn building_a_recipe_through_the_card() {
+        if !have_realm() {
+            return;
+        }
         let t = setup();
         let mut s = server(t.app.path());
         let args = json!({"recipe": "lantern-ring", "params": {"count": 6, "fire": 1}});
@@ -1876,6 +1982,9 @@ mod tests {
 
     #[test]
     fn talking_through_the_companion() {
+        if !have_realm() {
+            return;
+        }
         let t = setup();
         let mut s = server(t.app.path());
         let (ok, text) = call(&mut s, "den_say", json!({"text": "Wow, look at it"}));
@@ -1912,6 +2021,9 @@ mod tests {
 
     #[test]
     fn saving_a_recipe() {
+        if !have_realm() {
+            return;
+        }
         let t = setup();
         let mut s = server(t.app.path());
         let row = json!({"title": "Bench row", "params": {"n": {"default": 5, "min": 1, "max": 20, "whole": true}},
