@@ -59,6 +59,7 @@ panel); run those there.
 | `mods/SPEC.md` | the mod package format |
 | `docs/leyline/` | the Leyline docs: play, mods, publishing, hosting, launcher, Hero Key, other servers, commands |
 | `stream/playmodes.json` | the game-mode catalog the launcher builds in |
+| `stream/modepacks.json` | the mode templates (realms anyone can host and fork) the launcher builds in |
 | `launcher/` | the Leyline desktop launcher (Windows, macOS, Linux): clients, mods, realms, hosting. Build steps in `launcher/README.md` |
 
 The Mods & Workshop panel (`ModsPanel.lua`) uses the rest of the WrathUnleashed UI addon, so it stays in
