@@ -658,7 +658,7 @@ FRONT_DROP = (
     r'<article class="lp-mode" id="way-official">.*?</article>',      # the official realm's card (and its picture)
     r'<section class="hb-sbar\b.*?</section>',                        # the live platform status bar
     r'<li>One sign-in everywhere</li>',
-    r'<img\b[^>]*\bsrc="/wrath/avatar/[^"]*"[^>]*>',                    # profile pictures were drawn by the server
+    r'<img\b[^>]*\bsrc="/wrath/(?:avatar|art/avatars)/[^"]*"[^>]*>',                    # profile pictures were drawn by the server
     r'<li>Duels: the 1v1 queue[^<]*</li>',
     r'<a href="[^"]*">Open the forum</a>',              # the forum closed with the server                            # Duels ran on the official realm
 )
