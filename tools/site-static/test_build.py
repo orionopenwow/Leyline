@@ -38,7 +38,8 @@ STATIC = {
     "/wrath/docs": "the docs",
     "/wrath/leyline/news": "News (page)",
     "/wrath/leyline/news.json": "News (feed)",
-    "/wrath/leyline/flags.json": "feature flags: all off",
+    "/wrath/leyline/flags.json": "feature flags: all server features off",
+    "/mesh/snapshot.json": "the mesh's signed records (mesh/snapshot.json; empty but valid)",
     "/wrath/leyline/mods.json": "the mod rankings feed",
     "/wrath/mods/all.json": "the mods catalog",
     "/wrath/mods": "Mods (moves to /wrath/leyline/catalog)",
@@ -49,6 +50,7 @@ STATIC = {
     "/wrath/leyline/submit": "Submit a mod (moves to a GitHub issue)",
     "/wrath/leyline/forum": "the forum (moves to the Discord)",
     "/wrath/bugs": "Report a bug (moves to GitHub issues)",
+    "/j": "a world's one-click invite (the invite after #: host/invite.rs)",
 }
 SERVER_ONLY = {
     "/wrath": "Play in the browser and the account page (a page that moves to the front page)",
@@ -177,15 +179,58 @@ class Site(unittest.TestCase):
         doc = json.loads(self.files["wrath/leyline/flags.json"].read_bytes())
         self.assertEqual(doc["format"], 1)
         self.assertTrue(doc["flags"])
-        self.assertFalse(any(doc["flags"].values()), doc["flags"])
+        on = sorted(k for k, v in doc["flags"].items() if v)
+        self.assertEqual(on, sorted(B.SERVERLESS_FLAGS), "every server feature off; only what needs no server on")
         self.assertEqual(doc["stun"], [])
         self.assertFalse(any(doc["limits"].values()))
         body = {k: v for k, v in doc.items() if k != "sha256"}
         canon = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         self.assertEqual(doc["sha256"], hashlib.sha256(canon.encode()).hexdigest())
         rust = (REPO / "launcher" / "src-tauri" / "src" / "p2p" / "flags.rs").read_text(encoding="utf-8")
+        local_only = re.findall(r'"([a-z_]+)"', rust.split("pub const LOCAL_ONLY", 1)[1].split(";", 1)[0])
         for name in re.findall(r'\("([a-z_]+)", "', rust.split("pub const KNOWN", 1)[1].split("];", 1)[0]):
+            if name in local_only:
+                self.assertNotIn(name, doc["flags"], f"{name} is the PC's own switch")
+                continue
             self.assertIn(name, doc["flags"], f"the launcher knows {name}: the file should say it is off")
+        default_on = re.findall(r'"([a-z_]+)"', rust.split("pub const DEFAULT_ON", 1)[1].split(";", 1)[0])
+        self.assertTrue(set(B.SERVERLESS_FLAGS) <= set(default_on), "on in the file only what the launcher has on by default")
+
+    def test_mesh_snapshot(self):
+        doc = json.loads(self.files["mesh/snapshot.json"].read_bytes())
+        self.assertEqual(doc["v"], 1)
+        self.assertIsInstance(doc["records"], list)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "snapshot.json"
+            self.assertEqual(B.mesh_snapshot_doc(p), {"v": 1, "records": []}, "no file: empty but valid")
+            p.write_text('{"v": 1, "records": []}')
+            self.assertEqual(B.mesh_snapshot_doc(p)["records"], [])
+            keys = B._wunet_keys()
+            secret = bytes(range(32))
+            pub = keys.public_key(secret).hex()
+            beat = {"v": 1, "realm_id": keys.realm_id(bytes.fromhex(pub)), "pubkey": pub, "seq": 1, "ts": 1761700000,
+                    "relay": "relay.example.org", "record": {"name": "Signed"}, "status": {"online": True}}
+            rec = {"kind": "realm", "sig": keys.sign_doc(secret, beat, "wu-listing-heartbeat-v1"), "beat": beat, "endpoints": []}
+            p.write_text(json.dumps({"v": 1, "records": [rec]}))
+            self.assertEqual(B.mesh_snapshot_doc(p)["records"], [rec], "a signed record is served as it is")
+            c1, c2 = bytes([1] * 32), bytes([2] * 32)
+            blk = {"v": 1, "council": 1, "target": "r-" + beat["realm_id"], "reason": "spam", "ts": 1, "expires": 2}
+            council = {"kind": "block", "block": blk, "sigs": [{"key": keys.public_key(k).hex(),
+                       "sig": keys.sign_doc(k, blk, B.COUNCIL_CTX)} for k in (c1, c2)]}
+            p.write_text(json.dumps({"v": 1, "records": [council]}))
+            self.assertEqual(len(B.mesh_snapshot_doc(p)["records"]), 1)
+            for bad in ({**rec, "sig": "00" * 64}, {**rec, "beat": {**beat, "record": {"name": "Forged"}}},
+                        {k: v for k, v in rec.items() if k != "sig"}, {"kind": "game", "data": 1},
+                        {**council, "sigs": council["sigs"][:1]}):
+                p.write_text(json.dumps({"v": 1, "records": [bad]}))
+                with self.assertRaises(B.Refused):
+                    B.mesh_snapshot_doc(p)
+            p.write_text("{not json")
+            with self.assertRaises(B.Refused):
+                B.mesh_snapshot_doc(p)
+        # the launcher's mirrors name this file
+        brand = json.loads((REPO / "launcher" / "branding.json").read_text(encoding="utf-8"))
+        self.assertIn(B.ORIGIN + "/mesh/snapshot.json", brand["mesh_mirrors"])
 
     def test_realms_feed(self):
         doc = json.loads(self.files["wrath/realms.json"].read_bytes())
@@ -456,6 +501,35 @@ class Site(unittest.TestCase):
                 "    print('refused', e)\nelse:\n    print('CONNECTED')\n")
         r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60)
         self.assertIn("refused", r.stdout, r.stdout + r.stderr)
+
+    def test_join_page_opens_the_launcher_and_keeps_the_invite_in_the_browser(self):
+        page = self.pages[B.JOIN_PATH]
+        self.assertIn(LEGAL, page)
+        self.assertIsNone(BANNED.search(visible(page)))
+        # the invite is read from the fragment only, shape-checked, then opened as leyline://join/<invite>
+        script = re.findall(r"<script>(.*?)</script>", page, flags=re.S)
+        self.assertEqual(len(script), 1)
+        self.assertIn("location.hash", script[0])
+        self.assertIn("'leyline://join/'+h", script[0])
+        self.assertNotRegex(script[0], r"fetch|XMLHttpRequest|sendBeacon|WebSocket|<img|\.src\s*=")
+        # only that script may run (its hash in the page's policy), nothing loads from anywhere, no referrer
+        sha = __import__("base64").b64encode(hashlib.sha256(script[0].encode("utf-8")).digest()).decode()
+        csp = html.unescape(re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', page).group(1))
+        self.assertIn(f"script-src 'sha256-{sha}'", csp)
+        self.assertIn("default-src 'none'", csp)
+        self.assertIn('name="referrer" content="no-referrer"', page)
+        self.assertIn('name="robots" content="noindex"', page)
+        self.assertNotRegex(page, r'<(?:link|img|iframe)\b|src="http')
+        # Get Leyline is the fallback, and it is a page of the site
+        self.assertIn('id="j-get" href="/wrath/download"', page)
+        self.assertTrue(self.has("/wrath/download"))
+        self.assertNotIn("/j/", self.files["sitemap.xml"].read_text(encoding="utf-8"))
+        # the shape it takes is the launcher's (host/invite.rs make: lw1.<b64url>.<86 b64url>)
+        rx = re.search(r"/(\^lw1.*?\$)/", script[0]).group(1).replace("\\\\", "\\")
+        good = "lw1." + "a" * 400 + "." + "b" * 86
+        self.assertRegex(good, rx)
+        for bad in ("lw1.short.sig", "lw1.%s.%s<x" % ("a" * 20, "b" * 86), "javascript:alert(1)"):
+            self.assertNotRegex(bad, rx, bad)
 
     def test_same_inputs_same_bytes(self):
         with tempfile.TemporaryDirectory() as d:

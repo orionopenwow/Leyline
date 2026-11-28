@@ -10,6 +10,10 @@
 //!   replace the relay (`p2p_hosting`).
 //! * `mesh`: the realm list from the Leyline mesh (signed records from peers and seed relays, verified here) and
 //!   the relay chosen per realm (`mesh_realms`, `mesh_relays`). See docs/LEYLINE-MESH.md.
+//! * `dht`: signed address records on the public Mainline DHT (pkarr packets): publish ours when chosen, resolve
+//!   peers' and realms' (`dht`, on by default). `dht::lookup` is the transport's boundary. docs/leyline/network.md.
+//! * `gossip`: launchers hand each other the mesh records and the release log's tail (friends and the same network
+//!   now, the new transport later), every record checked by `mesh`.
 //! * `share`: "Help share Leyline's own files" (`share_own_files`): seed only what the signed release log names
 //!   (installers, Host packs, addons, upstream server source). See docs/RESILIENCE.md.
 //!
@@ -19,14 +23,23 @@
 //! * `friends`, `friendnet`: friends with no server: signed cards and friendships, sealed messages, the same network
 //!   or a relay's blind mailbox (docs/LEYLINE-FRIENDS.md).
 //!
+//! * `link`, `linknet`: launcher-to-launcher connections by key with no relay of ours: same network, direct, hole
+//!   punching, a mutual friend, community relays (docs/leyline/joining.md). The rules build everywhere; the network
+//!   side (`linknet`, iroh) only with the `link` feature on a desktop. On for friends with no site flag.
+//!
 //! See docs/P2P-AND-TORRENT.md.
 
 pub mod bencode;
 pub mod checker;
+pub mod dht;
 pub mod direct;
 pub mod flags;
 pub mod friendnet;
 pub mod friends;
+pub mod gossip;
+pub mod link;
+#[cfg(all(feature = "link", desktop))]
+pub mod linknet;
 pub mod magnet;
 pub mod mesh;
 pub mod nat;

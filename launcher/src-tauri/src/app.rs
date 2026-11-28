@@ -755,9 +755,18 @@ async fn join_invite(core: State<'_, Core>, client: String, link: String) -> Res
         }
         let (lan, at) = crate::host::denways::ways_in(&link);
         let lan_kept = lan.clone().unwrap_or_default();
-        let (way, list, tried) = blocking(move || Ok(crate::host::denways::pick(lan.as_deref(), at.as_deref(), crate::host::denways::connects))).await?;
+        let (mut way, list, mut tried) = blocking(move || Ok(crate::host::denways::pick(lan.as_deref(), at.as_deref(), crate::host::denways::connects))).await?;
         let (relay2, rid2, secret2) = (relay.clone(), rid.clone(), secret.clone());
-        let (address, name) = if way == "relay" {
+        // from anywhere by the host's key (p2p/link.rs), before the relay: a forwarder on 127.0.0.1 here
+        let (l3, r3, s3) = (link.clone(), rid.clone(), secret.clone());
+        let by_key = if way == "relay" { blocking(move || Ok(crate::p2p::link::guest_join(&l3, &r3, &s3))).await? } else { None };
+        let (address, name) = if let Some(Ok((addr, _))) = &by_key {
+            way = "key";
+            (crate::host::denways::realmlist(&addr), if lasting { "Your friend's world".to_string() } else { "Your friend's Den".to_string() })
+        } else if way == "relay" {
+            if let Some(Err(e)) = &by_key {
+                tried.push(format!("From anywhere: {e}"));
+            }
             let tried_now = tried.clone();
             blocking(move || realms::knock(&format!("https://{relay2}"), &rid2, &secret2)).await.map_err(|e| {
                 let before = if tried_now.is_empty() { String::new() } else { format!("{} ", tried_now.join(" ")) };
@@ -769,6 +778,7 @@ async fn join_invite(core: State<'_, Core>, client: String, link: String) -> Res
         // a single player world (host/worldfriends.rs): this launcher's identity claims its lasting login there before
         // the game logs in, so the same characters are there every time; a world that doesn't answer claims (an older
         // Leyline) takes the invite's one-time login as before
+        let mut joined_key = 1;
         let (user, pass) = if lasting {
             let app = settings::app_dir();
             let (addr, rid3, secret3, game, ticket) = (address.clone(), rid.clone(), secret.clone(), profile.path.clone(), guest.clone());
@@ -784,11 +794,22 @@ async fn join_invite(core: State<'_, Core>, client: String, link: String) -> Res
                 }
                 old.retain(|u| wf::ticket_ok(u));
                 old.dedup();
-                wf::claim_at(&addr, &peer, &rid3, &secret3, ticket.as_ref().map(|(u, p)| (u.as_str(), p.as_str())), &old)
+                // the Passport: a new join uses this world's own world key (and keeps a login agreement); a world
+                // joined before with the root key keeps using it (passport.rs, Joined.key)
+                let (signer, pp) = crate::passport::claim_for(&app, &peer, &rid3);
+                let v2 = pp.v2;
+                let (u, p, rec) = wf::claim_at_passport(&addr, &signer, &rid3, &secret3, ticket.as_ref().map(|(u, p)| (u.as_str(), p.as_str())), &old, &pp)?;
+                if let Some(r) = rec {
+                    let _ = crate::passport::keep_player_login(&app, &r);
+                }
+                Ok((u, p, if v2 { 2 } else { 1 }))
             })
             .await;
             match (claimed, guest) {
-                (Ok(up), _) => up,
+                (Ok((u, p, k)), _) => {
+                    joined_key = k;
+                    (u, p)
+                }
                 (Err(_), Some(g)) => g,
                 (Err(e), None) => return Err(format!("Your friend's world: {e}")),
             }
@@ -796,7 +817,7 @@ async fn join_invite(core: State<'_, Core>, client: String, link: String) -> Res
             guest.ok_or("That invite has no login in it.")?
         };
         if lasting {
-            let j = wf::Joined { relay: relay.clone(), secret: secret.clone(), lan: lan_kept, user: user.clone(), old: Vec::new(), name: name.clone(), at: now_secs() };
+            let j = wf::Joined { relay: relay.clone(), secret: secret.clone(), lan: lan_kept, user: user.clone(), old: Vec::new(), name: name.clone(), at: now_secs(), key: joined_key };
             let _ = wf::remember(&settings::app_dir(), &rid, j);
         }
         let _ = crate::herokey::set_login(&profile.path, &user, None);
@@ -2363,6 +2384,89 @@ fn set_world_stop_on_close(core: State<Core>, on: bool) -> Result<(), String> {
     })
 }
 
+/// Settings › Get worlds ready in the background (host/quickworld.rs).
+#[tauri::command]
+fn set_world_get_ready(core: State<Core>, on: bool) -> Result<(), String> {
+    core.update(|s| {
+        s.world_get_ready = on;
+        Ok(())
+    })
+}
+
+/// Background readiness (host/quickworld.rs, engine.rs begin_prepare): once the game folder is found, Single player's
+/// engine fetched and the maps read quietly, so a world's Start later is fast. Only while Settings › Get worlds ready
+/// in the background is on; nothing when there's no game folder yet (or several and none picked).
+#[tauri::command]
+fn world_prepare(core: State<Core>) -> Result<String, String> {
+    if !core.snapshot().world_get_ready {
+        return Ok("off".into());
+    }
+    let k = crate::host::engine::Kind::Single;
+    let Ok(c) = world_client(&core, k, "") else { return Ok("no game folder yet".into()) };
+    crate::host::engine::begin_prepare(&settings::app_dir(), c.path)
+}
+
+/// The background readiness line (the small note on the Host page).
+#[tauri::command]
+fn world_prepare_progress() -> crate::host::engine::Job {
+    crate::host::engine::prep_progress()
+}
+
+/// A one-click invite to a world running on this PC (host/invite.rs): the same friend's login and ways as Invite a
+/// friend (`world_invite_now`), signed by this launcher's peer key, as `leyline://join/<invite>` and the site's
+/// `https://leylinelauncher.com/j/#<invite>`.
+#[derive(Serialize)]
+struct WorldInviteLink {
+    invite: String,
+    app_link: String,
+    site_link: String,
+    expires: u64,
+    /// The same network way's line (the others are Invite a friend's).
+    ways: Vec<InviteWay>,
+}
+
+#[tauri::command]
+async fn world_invite_link(kind: String) -> Result<WorldInviteLink, String> {
+    let k = world_kind(&kind)?;
+    blocking(move || {
+        use crate::host::{denways, invite, litenet};
+        let d = world_invite_now(k)?;
+        let (_, rid, secret) = realms::parse_invite(&d.link).ok_or("The world's invite didn't come out right. Try again.")?;
+        let (user, pass) = litenet::guest_in(&d.link).ok_or("The world's invite has no friend's login. Try again.")?;
+        let (lan, _) = denways::ways_in(&d.link);
+        let me = crate::identity::peer_identity()?;
+        let app = settings::app_dir();
+        let name = crate::p2p::friends::Book::load(&app, &me, now_secs()).0.profile.name;
+        // this PC's device key when its connections run (world_invite_now offered the world by key): friends dial it
+        let device = crate::p2p::link::device_in(&d.link).map(|k| crate::identity::hex(&k));
+        let inv = invite::make(&me, &invite::Make { world: &rid, kind: k.word(), name: &name, secret: &secret, user: &user, pass: &pass, lan: lan.as_deref(), device: device.as_deref(), now: now_secs() })?;
+        let (app_link, site_link) = invite::links(&inv);
+        let expires = invite::open(&inv, now_secs())?.expires;
+        Ok(WorldInviteLink { invite: inv, app_link, site_link, expires, ways: d.ways })
+    })
+    .await
+}
+
+/// What a one-click invite says, checked (its signature, its fields, not run out): the card's "Join <name>'s world?"
+/// and the link Join takes (`join_invite`, the lasting-login handshake). Nothing joins here.
+#[derive(Serialize)]
+struct InviteCard {
+    title: String,
+    name: String,
+    peer: String,
+    kind: String,
+    expires: u64,
+    /// The ways to try first (the transport's own, the same network), as host/invite.rs `ways` gives them.
+    ways: Vec<String>,
+    link: String,
+}
+
+#[tauri::command]
+fn invite_open(invite: String) -> Result<InviteCard, String> {
+    let inv = crate::host::invite::open(&invite, now_secs())?;
+    Ok(InviteCard { title: inv.title(None), name: inv.name.clone(), peer: inv.peer.clone(), kind: inv.kind.clone(), expires: inv.expires, ways: crate::host::invite::ways(&inv), link: inv.legacy_link() })
+}
+
 /// Settings › Stop my world when the game closes.
 #[tauri::command]
 fn set_world_stop_on_exit(core: State<Core>, on: bool) -> Result<(), String> {
@@ -2821,6 +2925,51 @@ fn online_characters(core: State<Core>) -> Result<OnlineChars, String> {
     Ok(OnlineChars { realm: realms::SAMPLE_NAME, chars })
 }
 
+/// The Characters page's backups (host/charsave.rs): each of the player's characters with its newest save and the
+/// friends holding a sealed copy; the backup settings.
+#[tauri::command]
+async fn chars_saves() -> Result<crate::host::charsave::View, String> {
+    blocking(|| Ok(crate::host::charsave::view(&settings::app_dir()))).await
+}
+
+/// "Back up now": a world's characters saved (it must be running to read them) and sent, sealed, to friends.
+#[tauri::command]
+async fn chars_backup_now(kind: String) -> Result<String, String> {
+    let k = world_kind(&kind)?;
+    blocking(move || crate::host::charsave::back_up_now(&settings::app_dir(), k)).await
+}
+
+/// "Bring to another world", step one: what comes, what goes to the vault, what stays behind.
+#[tauri::command]
+async fn chars_bring_preview(id: String, to: String) -> Result<crate::host::charsave::Plan, String> {
+    let k = world_kind(&to)?;
+    blocking(move || crate::host::charsave::preview(&settings::app_dir(), &id, k)).await
+}
+
+/// "Bring": the character made in the other world from its newest signed save (a back-up of that world first).
+#[tauri::command]
+async fn chars_bring(id: String, to: String) -> Result<String, String> {
+    let k = world_kind(&to)?;
+    blocking(move || crate::host::charsave::bring(&settings::app_dir(), &id, k)).await
+}
+
+/// "Get my characters back from friends": every friend asked for the sealed copies they hold of mine.
+#[tauri::command]
+async fn chars_ask_back() -> Result<String, String> {
+    blocking(|| {
+        let h = crate::p2p::friendnet::current().ok_or("Turn your friends list on first (Friends page).")?;
+        let n = crate::host::charsave::ask_back(&crate::host::charsave::HubLink(&h));
+        Ok(if n == 0 { "No friend could be asked right now.".to_string() } else { format!("Asked {n} friends: copies they hold come back by themselves.") })
+    })
+    .await
+}
+
+/// Settings for sealed backups: how many friends hold a copy, and keeping friends' copies here.
+#[tauri::command]
+async fn chars_backup_settings(holders: Option<usize>, keep: Option<bool>) -> Result<(), String> {
+    blocking(move || crate::host::charsave::set_settings(&settings::app_dir(), holders, keep)).await
+}
+
 /// Invite a friend into a single player world while it runs (host/worldshare.rs): its own key on the Leyline relay
 /// (private, the tunnel Your Den uses: one at a time on this PC), the same network through the launcher's own
 /// forwarder, and one friend's login (a player, made over the world's console) in the link.
@@ -2898,9 +3047,33 @@ fn world_invite_now(k: crate::host::engine::Kind) -> Result<DenInvite, String> {
     let link = litenet::invite_link(realms::RELAY, &mine, &secret, Some((&user, &pass)));
     let code = denhost::code_from_link(&link).unwrap_or_default();
     let link = wf::with_mark(&denways::with_ways(&link, lan.as_deref(), None));
+    // from anywhere by key, no relay of ours (p2p/link.rs): the link carries this PC's key, never an address
+    let key_way = match crate::p2p::link::offer_world(&mine, &secret, front, eng::WORLD_PORT) {
+        Ok(()) => InviteWay { id: "key", ok: true, line: "From anywhere: on (your friend's launcher reaches this PC by its key; nothing of ours in between).".into() },
+        Err(e) => InviteWay { id: "key", ok: false, line: format!("From anywhere: off ({e}).") },
+    };
+    let link = crate::p2p::link::with_my_key(&link);
     // the game's Leyline tab shows it to the host (ov_world_share)
     let _ = eng::sql(&p, "acore_characters", &format!("{} {}", wf::INGAME_TABLES, wf::share_sql(true, &link, now_secs())));
-    Ok(DenInvite { link, code, name: "your friend".into(), expires: now_secs() + wf::TICKET_DAYS * 86_400, tunnel, ways: vec![lan_way, own_way, relay_way] })
+    Ok(DenInvite { link, code, name: "your friend".into(), expires: now_secs() + wf::TICKET_DAYS * 86_400, tunnel, ways: vec![lan_way, key_way, own_way, relay_way] })
+}
+
+/// A world on the public list, from anywhere (p2p/dht.rs `publish_realm` under the world's realm key: this PC's
+/// connection key as its endpoint, no address; put again every 30 minutes while the launcher runs). `listed` false
+/// takes it off. Sharing the world ending takes it off too. Not kept across launches yet.
+#[tauri::command]
+async fn world_set_listed(kind: String, listed: bool) -> Result<bool, String> {
+    let k = world_kind(&kind)?;
+    blocking(move || {
+        use crate::host::{litenet, worldshare as ws};
+        let share = ws::dir(&world_paths(k).root);
+        std::fs::create_dir_all(&share).map_err(|e| e.to_string())?;
+        let seed = litenet::load_or_create_key(&litenet::key_path(&share))?;
+        let dev = if listed { crate::p2p::link::my_device_hex() } else { None };
+        crate::p2p::link::list_world(&settings::app_dir(), seed, listed, dev.as_deref())?;
+        Ok(listed)
+    })
+    .await
 }
 
 /// Sharing a world ends: the same-network way, and its tunnel when the tunnel is this world's; friends' lasting
@@ -2912,6 +3085,12 @@ fn world_share_off(k: crate::host::engine::Kind) {
     let mine = litenet::load_or_create_key(&litenet::key_path(&share)).and_then(|s| litenet::public_key(&s)).map(|p| litenet::realm_id(&p)).ok();
     if mine.as_ref().is_some_and(|m| &litenet::state().realm_id == m) {
         litenet::stop();
+    }
+    if let Some(m) = &mine {
+        crate::p2p::link::withdraw_world(m);
+    }
+    if let Ok(seed) = litenet::load_or_create_key(&litenet::key_path(&share)) {
+        let _ = crate::p2p::link::list_world(&settings::app_dir(), seed, false, None); // off the public list too
     }
     ws::lan_stop();
     wf::front_stop();
@@ -3332,6 +3511,204 @@ async fn friends_join(peer_id: String) -> Result<String, String> {
         });
         let link = f.and_then(|f| f.invite.as_ref()).and_then(|m| m["msg"]["body"]["link"].as_str()).map(String::from);
         link.ok_or_else(|| "No invite from them yet: ask them to press Invite on your name.".to_string())
+    })
+    .await
+}
+
+// ---- The Passport (passport.rs; docs/leyline/passport.md; ui/passport.js): the peer key grown up. Thin wrappers:
+// everything is in passport.rs. Never a key in an answer except the phrase on its own screen.
+
+#[tauri::command]
+async fn passport_state() -> Result<serde_json::Value, String> {
+    blocking(|| Ok(crate::passport::page(&*friends_hub()?))).await
+}
+
+#[tauri::command]
+async fn passport_setup(name: String, picture: String) -> Result<Vec<String>, String> {
+    blocking(move || crate::passport::setup(&*friends_hub()?, &name, &picture)).await
+}
+
+/// The recovery phrase (Back up › Show my phrase): 12 words while a new key's wait, else 24.
+#[tauri::command]
+async fn passport_phrase() -> Result<Vec<String>, String> {
+    blocking(|| {
+        let h = friends_hub()?;
+        Ok(crate::passport::phrase_for(&h.app, &h.me).split(' ').map(String::from).collect())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn passport_finish() -> Result<(), String> {
+    blocking(|| crate::passport::finish(&*friends_hub()?)).await
+}
+
+/// Recover with the phrase: this PC becomes that Passport (the key it had kept aside).
+#[tauri::command]
+async fn passport_restore(phrase: String) -> Result<String, String> {
+    blocking(move || {
+        let seed = crate::passport::seed_from_phrase(&phrase)?;
+        let app = settings::app_dir();
+        if crate::identity::load_or_create(&app).map(|me| me.secret_seed() == seed).unwrap_or(false) {
+            return Ok("That's already this PC's Passport.".to_string());
+        }
+        let short = crate::identity::import_seed(&app, seed)?;
+        let _ = crate::passport::phrase_saved(&app);
+        crate::p2p::friendnet::reset();
+        let h = friends_hub()?;
+        let mut st = crate::passport::State::load(&app, &h.me);
+        st.setup_done = true;
+        crate::passport::ensure_this_device(&app, &h.me, &mut st)?;
+        st.save(&app)?;
+        Ok(format!("Done: this PC is your Passport again (Hero {short}). Restart Leyline to finish."))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn passport_guardians(peer_ids: Vec<String>) -> Result<String, String> {
+    blocking(move || crate::passport::set_guardians(&*friends_hub()?, &peer_ids)).await
+}
+
+#[tauri::command]
+async fn passport_device_revoke(id: String) -> Result<String, String> {
+    blocking(move || {
+        let h = friends_hub()?;
+        crate::passport::revoke_device(&h.app, &h.me, &id)
+    })
+    .await
+}
+
+/// The new PC: wait for the other one (the friends' listener carries the exchange).
+#[tauri::command]
+async fn passport_pair_wait() -> Result<(), String> {
+    blocking(|| {
+        let h = friends_hub()?;
+        crate::p2p::friendnet::start(&h);
+        crate::passport::pair_wait(&h.app)
+    })
+    .await
+}
+
+#[tauri::command]
+fn passport_pair_status() -> serde_json::Value {
+    crate::passport::pair_status()
+}
+
+#[tauri::command]
+fn passport_pair_cancel() {
+    crate::passport::pair_cancel()
+}
+
+/// The PC with the Passport: find the new one (on this network, or at an address typed as host:port).
+#[tauri::command]
+async fn passport_pair_find(addr: Option<String>) -> Result<String, String> {
+    blocking(move || {
+        let h = friends_hub()?;
+        crate::p2p::friendnet::start(&h);
+        let mut addrs: Vec<std::net::SocketAddr> = h.near.lock().map(|n| n.values().map(|x| x.addr).collect()).unwrap_or_default();
+        if let Some(a) = addr.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            let a = if a.contains(':') { a.to_string() } else { format!("{a}:{}", crate::p2p::friendnet::TCP_PORT) };
+            use std::net::ToSocketAddrs;
+            addrs.insert(0, a.to_socket_addrs().map_err(|_| "That address doesn't look right.".to_string())?.next().ok_or("That address doesn't look right.")?);
+        }
+        crate::passport::pair_find(&addrs)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn passport_pair_confirm(code: String) -> Result<String, String> {
+    blocking(move || {
+        let h = friends_hub()?;
+        crate::passport::pair_confirm(&h.app, &h.me, &code)
+    })
+    .await
+}
+
+/// No network between the PCs: a sealed file saved where the player picks; the 6 words that open it come back.
+#[tauri::command]
+async fn passport_pair_file_export(app: AppHandle) -> Result<Option<String>, String> {
+    let (text, six) = blocking(|| {
+        let h = friends_hub()?;
+        crate::passport::file_export(&h.me, &crate::passport::State::load(&h.app, &h.me))
+    })
+    .await?;
+    let to = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title("Save your Passport for your other PC").set_file_name("leyline-passport-for-other-pc.txt").add_filter("Text", &["txt"]).blocking_save_file())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| p.into_path().ok());
+    let Some(to) = to else { return Ok(None) };
+    std::fs::write(&to, text.as_bytes()).map_err(|e| format!("It wasn't saved: {e}"))?;
+    Ok(Some(six))
+}
+
+#[tauri::command]
+async fn passport_pair_file_import(app: AppHandle, words: String) -> Result<Option<String>, String> {
+    let Some(from) = pick(app, "Pick the Passport file from your other PC", true, false).await else { return Ok(None) };
+    blocking(move || {
+        if std::fs::metadata(&from).map(|m| m.len()).unwrap_or(u64::MAX) > 64 * 1024 {
+            return Err("That isn't a Leyline Passport file.".to_string());
+        }
+        let text = std::fs::read_to_string(&from).map_err(|_| "That isn't a Leyline Passport file.".to_string())?;
+        let p = crate::passport::file_import(&text, &words)?;
+        let m = crate::passport::install_payload(&settings::app_dir(), &p)?;
+        crate::p2p::friendnet::reset();
+        Ok(Some(m))
+    })
+    .await
+}
+
+/// Recover with guardians: the code to give them.
+#[tauri::command]
+async fn passport_recover_start() -> Result<String, String> {
+    blocking(|| crate::passport::recovery_start(&settings::app_dir())).await
+}
+
+#[tauri::command]
+fn passport_recover_cancel() {
+    crate::passport::recovery_cancel(&settings::app_dir())
+}
+
+/// A guardian's answer pasted: "1 of 2", or done (this PC is the Passport now; friends are asked to follow).
+#[tauri::command]
+async fn passport_recover_add(text: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let app = settings::app_dir();
+        match crate::passport::recovery_add(&app, &text)? {
+            None => Ok(serde_json::json!({"done": false, "approvals": crate::passport::recovery_load(&app).map(|r| r.approvals.len()).unwrap_or(0)})),
+            Some((rot, roster)) => {
+                crate::p2p::friendnet::reset();
+                let h = friends_hub()?;
+                crate::p2p::friendnet::start(&h);
+                let told = crate::passport::announce_rotation(&h, &rot, &roster);
+                Ok(serde_json::json!({"done": true, "told": told, "friends": roster.len()}))
+            }
+        }
+    })
+    .await
+}
+
+/// A guardian helps a friend: their code and who they are; the answer to send back.
+#[tauri::command]
+async fn passport_help_friend(code: String, peer_id: String) -> Result<String, String> {
+    blocking(move || crate::passport::help_friend(&*friends_hub()?, &code, &peer_id)).await
+}
+
+#[tauri::command]
+async fn passport_veto(id: String) -> Result<String, String> {
+    blocking(move || crate::passport::veto(&*friends_hub()?, &id)).await
+}
+
+/// The old Hero Key file, imported once as an alias (the key itself is never kept).
+#[tauri::command]
+async fn passport_herokey_import(app: AppHandle) -> Result<Option<String>, String> {
+    let Some(from) = pick(app, "Pick your Hero Key file", true, false).await else { return Ok(None) };
+    blocking(move || {
+        let text = crate::social::key_file_text(std::path::Path::new(&from))?;
+        let h = friends_hub()?;
+        crate::passport::import_herokey(&h.app, &h.me, &text).map(Some)
     })
     .await
 }
@@ -4959,6 +5336,7 @@ pub fn run() {
                 }
             }
             start_update_timer(app.handle().clone());
+            crate::host::charsave::start_timer(settings::app_dir()); // a character save every 30 minutes while a world runs
             crate::p2p::cmds::magnet_from_args(); // a shared magnet: link (only with the magnet_links flag on)
             crate::agents::commands::start(app.handle().clone()); // Agents: the heartbeat `Leyline mcp` looks for (agents.rs)
             // Be a node (p2p/node.rs): its loop, when this PC turned it on; started by "start with Windows" (--node):
@@ -5167,6 +5545,7 @@ pub fn run() {
             world_choices,
             world_settings_get, // Single player's world settings before the first load and later (host/spsettings.rs)
             world_settings_set,
+            world_set_listed, // a world on the public list via the DHT (p2p/dht.rs publish_realm; no button yet)
             world_mods_get, // Single player's "Mods in this world": the engine's own modules, off or on (host/worldmods.rs)
             world_mods_set,
             world_play,
@@ -5181,7 +5560,18 @@ pub fn run() {
             close_leyline,
             local_characters,
             online_characters,
+            chars_saves,
+            chars_backup_now,
+            chars_bring_preview,
+            chars_bring,
+            chars_ask_back,
+            chars_backup_settings,
             world_invite,
+            world_invite_link, // worlds in three clicks (host/invite.rs, host/quickworld.rs): the one-click invite, its card, readiness
+            invite_open,
+            world_prepare,
+            world_prepare_progress,
+            set_world_get_ready,
             world_share_stop,
             world_friends,
             world_friend,
@@ -5190,6 +5580,26 @@ pub fn run() {
             join_friend_again,
             friends_state,
             friends_start,
+            passport_state,
+            passport_setup,
+            passport_phrase,
+            passport_finish,
+            passport_restore,
+            passport_guardians,
+            passport_device_revoke,
+            passport_pair_wait,
+            passport_pair_status,
+            passport_pair_cancel,
+            passport_pair_find,
+            passport_pair_confirm,
+            passport_pair_file_export,
+            passport_pair_file_import,
+            passport_recover_start,
+            passport_recover_cancel,
+            passport_recover_add,
+            passport_help_friend,
+            passport_veto,
+            passport_herokey_import,
             friends_stop,
             friends_profile,
             friends_code,
@@ -5263,6 +5673,8 @@ pub fn run() {
             crate::p2p::cmds::node_set,
             crate::p2p::cmds::node_check_network,
             crate::p2p::cmds::node_quit,
+            crate::p2p::cmds::link_state, // Settings › Network: friends from anywhere by key (p2p/link.rs)
+            crate::p2p::cmds::link_set,
             crate::p2p::cmds::p2p_flags,
             crate::p2p::cmds::p2p_set_flag,
             crate::p2p::cmds::p2p_set_limits,

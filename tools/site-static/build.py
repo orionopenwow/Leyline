@@ -10,8 +10,9 @@ saves its read-only pages at the same URL paths, so launchers already installed 
 /wrath/mods/all.json stays /wrath/mods/all.json, /wrath/docs/mods becomes /wrath/docs/mods/index.html, and so on.
 
 What it writes:
-  * the feeds the launcher reads: flags.json (every server feature off), news.json, mods.json, catalog.json,
-    all.json, modes.json, realms.json (from site/realms.json), status.json, the boards index;
+  * the feeds the launcher reads: flags.json (every server feature off; the mesh list, which needs no server, on),
+    news.json, mods.json, catalog.json, all.json, modes.json, realms.json (from site/realms.json), status.json, the
+    boards index, and mesh/snapshot.json (the signed mesh records in the repo's mesh/snapshot.json, checked here);
   * the pages: the front page, Start here, Realms, Download, Mods, Addons, Looks, each mod's page, Creators, News,
     the docs and their search, robots.txt, sitemap.xml, 404.html, CNAME;
   * the art those pages use, and the Looks pictures the launcher shows.
@@ -101,7 +102,7 @@ DOCS_NOTE_WORDS = re.compile(r"(?i)\brelay\b|hero key|official realm|wrath unlea
 # The feeds launchers read (path -> how it is made). Every one is a plain file.
 FEEDS = ("/wrath/leyline/flags.json", "/wrath/leyline/news.json", "/wrath/leyline/mods.json",
          "/wrath/leyline/catalog.json", "/wrath/mods/all.json", "/wrath/modes.json", "/wrath/realms.json",
-         "/wrath/status.json", "/wrath/api/boards/index.json", "/wrath/docs/search.json")
+         "/wrath/status.json", "/wrath/api/boards/index.json", "/wrath/docs/search.json", "/mesh/snapshot.json")
 # A catalog page's filter links (one parameter) become pages of their own: /wrath/leyline/catalog?cat=ui is saved as
 # /wrath/leyline/catalog/cat-ui/ and the links point there. Links with more parameters go to the plain page.
 FILTER_PAGES = ("/wrath/leyline/catalog", "/wrath/leyline/addons")
@@ -663,6 +664,9 @@ def front_body() -> str:
 FRONT_DROP = (
     r'<article class="lp-mode" id="way-official">.*?</article>',      # the official realm's card (and its picture)
     r'<section class="hb-sbar\b.*?</section>',                        # the live platform status bar
+    # the live realm list block: its first row is always the official realm ("Official realm", "Plays in your
+    # browser", the client version) and its line counts players online; the realm list has its own page now
+    r'<section class="hb-sec hb-realms" id="realms".*?</section>',
     r'<li>One sign-in everywhere</li>',
     r'<img\b[^>]*\bsrc="/wrath/(?:avatar|art/avatars)/[^"]*"[^>]*>',                    # profile pictures were drawn by the server
     r'<li>Duels: the 1v1 queue[^<]*</li>',
@@ -700,44 +704,46 @@ FORWARD_ICONS = {
 SOON = "Coming"
 # (id, eyebrow, building now?, heading, lede, [(point, coming?)], docs page, picture, alt)
 FORWARD = (
-    ("passport", "The Passport", True, "Log in with no server",
+    ("passport", "The Passport", False, "Log in with no server",
      "Your Passport is a key on your PC. When you join a world, the host and your launcher sign a login agreement "
      "together, so you never type a password and no website decides who you are.",
      [("A key on your PC, made by the launcher", False),
-      ("A key for each device, and a separate key per world for privacy", True),
-      ("A 12-word recovery phrase you keep", True),
-      ("Friends as guardians: two of them co-sign a recovery", True)],
+      ("A key for each device, and a separate key per world for privacy", False),
+      ("A 12-word recovery phrase you keep", False),
+      ("Friends as guardians: two of them co-sign a recovery", False)],
      "/wrath/docs/passport", "passport.svg",
      "A crystal key in the middle, linked to a laptop and a phone on one side and to three worlds on the other, "
      "each with its own small key; two friends below sign together."),
-    ("joining", "Friends & joining", True, "Friends connect straight to each other",
+    ("joining", "Friends & joining", False, "Friends connect straight to each other",
      "Launchers find each other by Passport key, with no relay of ours in the middle. When a relay is needed, it "
      "only passes encrypted bytes.",
      [("Signed friendships, kept on your PC", False),
-      ("Same network first, then direct, then hole punching: about 9 in 10 connections can go direct", True),
-      ("If not, a friend relays for you, then any community relay", True),
+      ("Same network first, then straight to their launcher by key", False),
+      ("Hole punching through home routers", True),
+      ("If not, a friend relays for you, then any community relay", False),
       ("One-click invite links to your world", False)],
      "/wrath/docs/joining", "joining.svg",
      "Two launchers joined by a direct line carrying locked packets, with fallback routes below through a friend "
      "and through a relay that only sees locked data."),
-    ("characters", "Characters", True, "Characters that outlive any server",
-     "Your character is yours, not the server's. If a world shuts down, you will be able to take your character to "
-     "another one.",
+    ("characters", "Characters", False, "Characters that outlive any server",
+     "Your character is yours, not the server's. Every save is signed and backed up with friends, so if a world "
+     "shuts down, your character goes on.",
      [("When you host, your friends' characters are kept on your world for them", False),
-      ("Signed saves on your PC", True),
-      ("Sealed backups on 3 friends' launchers", True),
-      ("Move a character to another world if one shuts down", True),
+      ("Signed saves on your PC", False),
+      ("Sealed backups on 3 friends' launchers", False),
+      ("Move a character to another of your worlds", False),
+      ("Take a character to a friend's world", True),
       ("Gold never travels, and nothing is traded across worlds", False)],
      "/wrath/docs/characters", "characters.svg",
      "A sealed character crystal inside a shield, with locked copies on three friends' laptops and an arrow "
      "carrying it from one world to another."),
     ("network", "A network with no centre", False, "Nobody can switch it off, including us",
      "Every realm, relay and release is a signed record, and launchers pass the records to each other. A public "
-     "table and several mirrors will keep copies too; this site will be one mirror among many.",
+     "table and mirrors keep copies too, and this site is just one of them.",
      [("Signed records for every realm, relay and release", False),
       ("Passed from launcher to launcher", False),
-      ("A public distributed table to find them", True),
-      ("Several mirrors, this site among them", True)],
+      ("A public distributed table to find them", False),
+      ("Mirrors of the records, this site among them", False)],
      "/wrath/docs/network", "network.svg",
      "A wide mesh of launchers linked to their neighbours, with no node in the middle and signed records "
      "travelling along the lines."),
@@ -895,12 +901,132 @@ def moved_page(to: str) -> bytes:
             f'</html>\n').encode("utf-8")
 
 
+# --------------------------------------------------------------------------------------------- the invite page (/j/)
+# A world's one-click invite (launcher/src-tauri/src/host/invite.rs): https://leylinelauncher.com/j/#<invite>. The
+# invite sits after "#", so it never reaches this site's server or its logs; the page's script reads it in the browser,
+# checks only its shape, and opens the launcher with leyline://join/<invite> (the launcher checks the host's signature
+# and asks "Join <name>'s world?"). When the launcher doesn't open: Get Leyline. Its own small page: no frame, no other
+# file, a script allowed by its hash only, no referrer.
+JOIN_PATH = "j/index.html"
+JOIN_SCRIPT = (
+    "(function(){var h=location.hash.slice(1),ok=/^lw1\\.[A-Za-z0-9_-]{8,600}\\.[A-Za-z0-9_-]{40,120}$/.test(h),"
+    "a=document.getElementById('j-open'),m=document.getElementById('j-msg');"
+    "if(!ok){a.hidden=true;m.textContent='This invite link is not complete. Ask your friend to copy it again.';return;}"
+    "var l='leyline://join/'+h;a.href=l;a.hidden=false;"
+    "m.textContent='Opening Leyline\\u2026 If nothing happens, press Open in Leyline, or get Leyline first.';"
+    "setTimeout(function(){location.href=l;},150);})();"
+)
+
+
+def join_page() -> bytes:
+    """The /j/ page: open the launcher on the invite after '#', with Get Leyline when it isn't installed."""
+    sha = base64.b64encode(hashlib.sha256(JOIN_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+    csp = f"default-src 'none'; script-src 'sha256-{sha}'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'"
+    style = ("body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0f1a;color:#e8e6f0;"
+             "font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:440px;padding:24px;text-align:center}"
+             "h1{font-size:24px;margin:0 0 8px}p{margin:8px 0;color:#b9b6c9}.b{display:inline-block;margin:12px 6px 0;"
+             "padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600}.p{background:#7c5cff;color:#fff}"
+             ".s{border:1px solid #7c5cff;color:#cfc4ff}footer{margin-top:28px;font-size:12px;color:#8a879b}")
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        f'<meta http-equiv="Content-Security-Policy" content="{esc(csp)}">'
+        '<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Join a friend's world · Leyline</title>"
+        f"<style>{style}</style></head><body><main>"
+        "<h1>Join a friend's world</h1>"
+        '<p id="j-msg">This link opens Leyline, which asks before anything joins.</p>'
+        '<a class="b p" id="j-open" href="/wrath/download" hidden>Open in Leyline</a>'
+        '<a class="b s" id="j-get" href="/wrath/download">Get Leyline</a>'
+        "<p>Your friend's invite stays in this link: it is not sent to this website.</p>"
+        f'<footer>Leyline is a fan project, {LEGAL}.</footer>'
+        f"</main><script>{JOIN_SCRIPT}</script></body></html>\n"
+    ).encode("utf-8")
+
+
 # --------------------------------------------------------------------------------------------- feeds
+# Flags that need no server of ours: on in the site's file (p2p/flags.rs DEFAULT_ON; the realm list from signed
+# records reads mirrors, cached peers, friends and the DHT).
+SERVERLESS_FLAGS = ("mesh_realms",)
+
+
 def flags_doc(leyline_net, stamp: str) -> dict:
-    """Every server feature off, hashed as the launcher checks it (p2p/flags.rs)."""
+    """Every server feature off (the serverless ones on), hashed as the launcher checks it (p2p/flags.rs)."""
     if leyline_net is None:
         raise Refused("stream/leyline_net.py did not load: the flags file needs its hash")
-    return leyline_net.make_doc(flags={}, limits={}, stun=[], updated_at=stamp)
+    return leyline_net.make_doc(flags={k: True for k in SERVERLESS_FLAGS}, limits={}, stun=[], updated_at=stamp)
+
+
+# --------------------------------------------------------------------------------------------- the mesh snapshot
+MESH_SNAPSHOT = REPO / "mesh" / "snapshot.json"
+MESH_KINDS = {"realm": ("beat", "wu-listing-heartbeat-v1"), "relay": ("node", "leyline-mesh-node-v1"),
+              "info": ("info", "leyline-mesh-info-v1"), "block": ("block", "leyline-mesh-block-v1")}
+COUNCIL_CTX = "leyline-mesh-council-block-v1"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
+
+
+def _wunet_keys():
+    """hosting/kit/tools/wunet/keys.py (pure-Python Ed25519 when `cryptography` isn't installed)."""
+    tools = str(REPO / "hosting" / "kit" / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from wunet import keys  # noqa: E402
+    return keys
+
+
+def _canon(d) -> str:
+    return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def mesh_record_ok(rec, keys) -> str | None:
+    """Why a mesh record can't go in the snapshot (None: it can). Signed records only, each signature checked; the
+    launcher checks everything again (p2p/mesh.rs), expiry included, so an old record does no harm."""
+    if not isinstance(rec, dict) or rec.get("kind") not in MESH_KINDS:
+        return "not a mesh record (kind realm, relay, info or block)"
+    if len(_canon(rec)) > 6000:
+        return "bigger than 6000 bytes"
+    part, ctx = MESH_KINDS[rec["kind"]]
+    doc = rec.get(part)
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        return f"no {part} document"
+    if rec["kind"] == "block" and "council" in doc:
+        sigs = rec.get("sigs")
+        if not isinstance(sigs, list) or not 2 <= len(sigs) <= 8:
+            return "a council block needs two to eight signatures"
+        for s in sigs:
+            if not (isinstance(s, dict) and HEX64.match(str(s.get("key"))) and HEX128.match(str(s.get("sig")))
+                    and keys.verify_doc(bytes.fromhex(s["key"]), doc, COUNCIL_CTX, s["sig"])):
+                return "a council signature does not verify"
+        return None
+    signer = doc.get("staff") if rec["kind"] == "block" else doc.get("pubkey")
+    if not (HEX64.match(str(signer)) and HEX128.match(str(rec.get("sig")))):
+        return "unsigned"
+    if not keys.verify_doc(bytes.fromhex(signer), doc, ctx, rec["sig"]):
+        return "the signature does not verify"
+    return None
+
+
+def mesh_snapshot_doc(path: Path = MESH_SNAPSHOT) -> dict:
+    """/mesh/snapshot.json: the format p2p/mesh.rs reads ({"v": 1, "records": [...]}), signed records only, in the
+    file's order; empty but valid when there is no file or no record."""
+    if not path.is_file():
+        return {"v": 1, "records": []}
+    try:
+        src = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Refused(f"{path.name}: not JSON ({e})")
+    recs = src.get("records") if isinstance(src, dict) else None
+    if not isinstance(recs, list):
+        raise Refused(f"{path.name}: no \"records\" list")
+    if not recs:
+        return {"v": 1, "records": []}
+    keys = _wunet_keys()
+    for i, r in enumerate(recs):
+        why = mesh_record_ok(r, keys)
+        if why:
+            raise Refused(f"{path.name}: record {i}: {why}")
+    return {"v": 1, "records": recs}
 
 
 def status_doc(stamp: str) -> dict:
@@ -992,6 +1118,7 @@ class Build:
         self.put_file("wrath/leyline/news.json", dump(news))
         self.put_file("wrath/realms.json", dump(realms_doc(realms, self.stamp)))
         self.put_file("wrath/status.json", dump(status_doc(self.stamp)))
+        self.put_file("mesh/snapshot.json", dump(mesh_snapshot_doc()))
         # the modes the launcher offered all ran on the official realm: none now (the launcher's own copy is built in)
         self.put_file("wrath/modes.json", dump({"schema": 1, "modes": []}))
         self.put_file("wrath/api/boards/index.json", dump({"v": 1, "week": None, "official": [], "community": []}))
@@ -1134,6 +1261,8 @@ class Build:
                     st2, _, b2, _ = portal.get(urllib.parse.quote(u))
                     if st2 == 200:
                         self.put_file(out_file(u), b2)
+        # the one-click invite page (its own section above; kept out of the sitemap: it is noindex)
+        self.put_file(JOIN_PATH, join_page())
         # the favicon at the root, robots, sitemap, the domain
         ico = self.files.get("wrath/art/leyline-favicon-32.png")
         if ico:
@@ -1141,6 +1270,7 @@ class Build:
         pages = sorted({"/" + f[:-len("index.html")].rstrip("/") if f != "index.html" else "/"
                         for f in self.files if f.endswith("index.html")} - {"/" + o.strip("/") for o in list(MOVED) + list(CLOSED) + list(ELSEWHERE)})
         pages = [p for p in pages if not any(p.startswith(fp + "/") or p == fp for fp in self.filters)]
+        pages = [p for p in pages if p != "/" + JOIN_PATH[:-len("/index.html")]]
         self.put_file("robots.txt", f"User-agent: *\nAllow: /\nSitemap: {ORIGIN}/sitemap.xml\n")
         self.put_file("sitemap.xml", '<?xml version="1.0" encoding="UTF-8"?>\n'
                       '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'

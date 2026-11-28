@@ -208,14 +208,46 @@ impl Hub {
         if !self.seen.lock().unwrap().first(&nonce) {
             return Ok(Event::Ignored("seen"));
         }
+        // character saves, sealed backups and witnesses (host/charsave.rs): from friends only
+        if rec["msg"]["kind"] == "chars" {
+            let from = rec["msg"]["from"].as_str().unwrap_or("").to_string();
+            if !self.book.lock().unwrap().is_friend(&self.me, &identity::peer_id(&identity::unhex32(&from).unwrap_or([0; 32]))) {
+                return Ok(Event::Ignored("not a friend"));
+            }
+            let link = crate::host::charsave::HubLink(self);
+            return crate::host::charsave::on_message(&self.app, &self.me, &from, &rec["msg"]["body"], &link, now).map(Event::Ignored);
+        }
         let ev = self.book.lock().unwrap().receive(&self.me, &rec, via, now)?;
+        if let Event::Mesh(from) = &ev {
+            // the mesh's own rules decide what is kept (p2p/gossip.rs); the book doesn't change
+            if super::flags::current(&self.app).mesh_realms {
+                super::gossip::take(&self.app, from, &rec["msg"]["body"], now)?;
+            }
+            return Ok(ev);
+        }
         if !matches!(ev, Event::Ignored(_)) {
             self.save()?;
+        }
+        // the Passport (crate::passport): guardians lists kept, rotations answered, a rotation of my own key told
+        let body = &rec["msg"]["body"];
+        match &ev {
+            Event::Guardian(_) => {
+                let roster: Vec<String> = body["roster"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect()).unwrap_or_default();
+                let _ = crate::passport::keep_guarding(&self.app, &self.me, rec["msg"]["from"].as_str().unwrap_or(""), &body["guardians"], &roster);
+            }
+            Event::Rotated(_) => self.send_due_rotations(),
+            Event::RotationOfMe(rot) => {
+                let _ = crate::passport::keep_alert(&self.app, &self.me, rot);
+            }
+            _ => {}
         }
         let say = match &ev {
             Event::Request(p) => Some(format!("{} wants to be friends.", self.name_of(p))),
             Event::Accepted(p) => Some(format!("{} accepted: you're friends now.", self.name_of(p))),
             Event::Invite(p) => Some(format!("{} invited you to their world.", self.name_of(p))),
+            Event::Rotated(_) => Some("A friend got their Passport back on a new PC: you're still friends.".to_string()),
+            Event::RotationWaiting(p) => Some(format!("{} is getting their Passport back with their guardians. It takes effect in 3 days.", self.name_of(p))),
+            Event::RotationOfMe(_) => Some("Someone is asking your guardians for your Passport. If that isn't you, open Passport and stop it.".to_string()),
             _ => None,
         };
         if let Some(s) = say {
@@ -276,8 +308,26 @@ impl Hub {
                 Err(e) => tried.push(format!("direct: {e}")),
             }
         }
+        // from anywhere by key (p2p/linknet.rs): ways 1 to 3 only for presence (quick), every way for the rest; a
+        // friend you both have keeps other messages (sealed) while they're offline
+        #[cfg(all(feature = "link", desktop))]
+        if let Some(l) = super::linknet::current() {
+            let env = friends::envelope(&pk, msg, None)?;
+            let quick = matches!(kind, "presence" | "card" | "mesh");
+            let total = if quick { super::linknet::QUICK_TOTAL } else { Duration::from_secs(40) };
+            match super::linknet::block(l.send_envelope(&pk, &env, total, !quick)) {
+                Ok(_) => return Ok("link"),
+                Err(e) => tried.push(format!("from anywhere: {e}")),
+            }
+            if !quick {
+                match super::linknet::block(l.hold(&pk, &env)) {
+                    Ok(()) => return Ok("held"),
+                    Err(e) => tried.push(format!("with a friend: {e}")),
+                }
+            }
+        }
         if let Some(r) = mailbox.or(relay.map(String::from)).filter(|r| crate::realms::relay_ok(r)) {
-            let tag = matches!(kind, "presence" | "card").then(|| friends::tag_for(&self.me, to, kind));
+            let tag = matches!(kind, "presence" | "card" | "mesh").then(|| friends::tag_for(&self.me, to, kind));
             match mailbox_post(&r, &friends::envelope(&pk, msg, tag.as_deref())?) {
                 Ok(()) => return Ok("relay"),
                 Err(e) => tried.push(format!("relay mailbox: {e}")),
@@ -308,6 +358,11 @@ impl Hub {
         if let Some(a) = self.direct.lock().unwrap().clone().filter(|_| online) {
             body["addr"] = json!(a);
         }
+        // where this PC's connections can be reached (sealed to each friend; p2p/linknet.rs)
+        #[cfg(all(feature = "link", desktop))]
+        if let Some(p) = super::linknet::presence_part().filter(|_| online) {
+            body["link"] = p;
+        }
         for k in keys {
             if self.stop.load(Ordering::Relaxed) && online {
                 break;
@@ -316,6 +371,36 @@ impl Hub {
                 let _ = self.deliver(&k, &m, None);
             }
         }
+    }
+
+    /// Gossip (p2p/gossip.rs): this PC's mesh records to each friend and each launcher near, at most
+    /// `gossip::MAX_PEERS`, one message each. Off with `mesh_realms`.
+    pub fn gossip_all(&self) -> usize {
+        if !super::flags::current(&self.app).mesh_realms {
+            return 0;
+        }
+        let body = super::gossip::body(&self.app, now());
+        if body["recs"].as_array().map_or(true, |a| a.is_empty()) && body.get("chain").is_none() {
+            return 0;
+        }
+        let mut keys = self.book.lock().unwrap().keys(&self.me);
+        if self.book.lock().unwrap().profile.lan != "off" {
+            for (k, _) in self.near_list(now()) {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        let mut sent = 0;
+        for k in keys.into_iter().take(super::gossip::MAX_PEERS) {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(m) = friends::make_msg(&self.me, &k, "mesh", body.clone(), now()) {
+                sent += self.deliver(&k, &m, None).is_ok() as usize;
+            }
+        }
+        sent
     }
 
     /// Fetch and apply this PC's mailbox at its relay.
@@ -338,6 +423,17 @@ impl Hub {
     }
 
     /// Requests still waiting go out again (start-up: the other side may be reachable now).
+    /// Friends' Passport rotations whose wait is over: applied, and the accepts sent.
+    pub fn send_due_rotations(&self) {
+        let out = self.book.lock().unwrap().due_rotations(&self.me, now());
+        if !out.is_empty() {
+            let _ = self.save();
+        }
+        for (to, m) in out {
+            let _ = self.deliver(&to, &m, None);
+        }
+    }
+
     fn resend_requests(&self) {
         let out: Vec<(String, Option<String>)> = self.book.lock().unwrap().outgoing.iter().map(|o| (o.to.clone(), o.relay.clone())).collect();
         for (to, relay) in out {
@@ -379,6 +475,8 @@ fn serve_conn(hub: &Hub, mut s: TcpStream, peer: SocketAddr) {
         let r = s.try_clone().map(|c| BufReader::new(c.take(friends::ENVELOPE_MAX as u64 + 2)).read_until(b'\n', &mut line));
         match r {
             Ok(Ok(_)) if line.ends_with(b"\n") => match serde_json::from_slice::<Value>(&line) {
+                // a second PC joining this player's Passport (crate::passport pair_*): its own short exchange
+                Ok(env) if env.get("pair").is_some() => crate::passport::pair_serve(&hub.app, &env),
                 Ok(env) => {
                     let via = if local_ip(&peer.ip()) { Via::Lan } else { Via::Direct };
                     match hub.take(&env, via, t) {
@@ -435,6 +533,15 @@ pub fn hub(app: &Path) -> Result<Arc<Hub>, String> {
     let x = Hub::new(app, identity::load_or_create(app)?);
     *h = Some(x.clone());
     Ok(x)
+}
+
+/// This PC's key changed (the Passport: a recovery, a second device): the old hub stops and the next [`hub`] is made
+/// for the new key.
+pub fn reset() {
+    let old = HUB.lock().ok().and_then(|mut h| h.take());
+    if let Some(h) = old {
+        stop(&h);
+    }
 }
 
 /// Start listening and beaconing (once). Ports in use: any free one for TCP (the beacon says which), and beacons
@@ -522,11 +629,26 @@ pub fn start(hub: &Arc<Hub>) -> NetState {
             }
             if tick % PRESENCE_EVERY == 15 {
                 h.presence_all(true);
+                h.send_due_rotations();
             }
+            if tick % super::gossip::EVERY == 45 {
+                h.gossip_all();
+            }
+
             std::thread::sleep(Duration::from_secs(1));
             tick += 1;
         }
     });
+    // friends from anywhere, by key (p2p/linknet.rs; off in Settings › Network)
+    #[cfg(all(feature = "link", desktop))]
+    {
+        let h = hub.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = super::linknet::start_for(&h) {
+                h.state.lock().unwrap().last_error = e;
+            }
+        });
+    }
     hub.state.lock().unwrap().clone()
 }
 
@@ -536,6 +658,8 @@ pub fn stop(hub: &Arc<Hub>) {
         return;
     }
     hub.presence_all(false);
+    #[cfg(all(feature = "link", desktop))]
+    super::linknet::stop();
     hub.stop.store(true, Ordering::Relaxed);
     hub.gen.fetch_add(1, Ordering::SeqCst);
     hub.state.lock().unwrap().running = false;
